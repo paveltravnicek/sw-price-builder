@@ -4,7 +4,9 @@
  * Description: Univerzální builder ceníků s podporou více ceníků, kategorií, položek a dynamického výstupu odolného vůči cache.
  * Version: 1.0
  * Author: Smart Websites
- *  * Text Domain: sw-price-builder
+ * Author URI: https://smart-websites.cz
+ * Update URI: https://github.com/paveltravnicek/sw-price-builder/
+ * Text Domain: sw-price-builder
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
