@@ -7,14 +7,13 @@
  * Author URI: https://smart-websites.cz
  * Update URI: https://github.com/paveltravnicek/sw-price-builder/
  * Text Domain: sw-price-builder
+ * SW Plugin: yes
+ * SW Service Type: passive
+ * SW License Group: both
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
-}
-
-if ( ! defined( 'ABSPATH' ) ) {
-	exit;
 }
 
 require __DIR__ . '/plugin-update-checker/plugin-update-checker.php';
@@ -39,6 +38,10 @@ final class SW_Price_Builder {
     const OPTION_DB_VERSION = 'swpb_db_version';
     const DB_VERSION = '0.1.0';
     const REST_NAMESPACE = 'sw-price-builder/v1';
+    const LICENSE_OPTION = 'swpb_license';
+    const LICENSE_CRON_HOOK = 'swpb_license_daily_check';
+    const HUB_BASE = 'https://smart-websites.cz';
+    const PLUGIN_SLUG = 'sw-price-builder';
 
     private static $instance = null;
     private $table_pricelists = '';
@@ -59,10 +62,16 @@ final class SW_Price_Builder {
         $this->table_items      = $wpdb->prefix . 'swpb_items';
 
         register_activation_hook( __FILE__, array( __CLASS__, 'activate' ) );
+        register_deactivation_hook( __FILE__, array( __CLASS__, 'deactivate' ) );
 
         add_action( 'plugins_loaded', array( $this, 'maybe_upgrade_db' ) );
+        add_action( self::LICENSE_CRON_HOOK, array( $this, 'cron_refresh_plugin_license' ) );
         add_action( 'admin_menu', array( $this, 'admin_menu' ) );
         add_action( 'admin_init', array( $this, 'handle_admin_post' ) );
+        add_action( 'admin_init', array( $this, 'maybe_refresh_plugin_license' ) );
+        add_action( 'admin_init', array( $this, 'block_direct_deactivate' ) );
+        add_action( 'admin_post_swpb_verify_license', array( $this, 'handle_verify_license' ) );
+        add_action( 'admin_post_swpb_remove_license', array( $this, 'handle_remove_license' ) );
         add_action( 'admin_enqueue_scripts', array( $this, 'admin_assets' ) );
         add_action( 'wp_enqueue_scripts', array( $this, 'frontend_assets' ) );
         add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
@@ -70,6 +79,7 @@ final class SW_Price_Builder {
         add_action( 'wp_ajax_swpb_save_item_order', array( $this, 'ajax_save_item_order' ) );
         add_action( 'wp_ajax_swpb_get_categories', array( $this, 'ajax_get_categories' ) );
 
+        add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), array( $this, 'add_plugin_action_links' ) );
         add_shortcode( 'sw_pricelist', array( $this, 'shortcode_pricelist' ) );
         add_shortcode( 'sw_pricelist_updated', array( $this, 'shortcode_updated' ) );
     }
@@ -81,6 +91,86 @@ final class SW_Price_Builder {
         if ( ! get_option( self::OPTION_SETTINGS ) ) {
             add_option( self::OPTION_SETTINGS, $self->get_default_settings() );
         }
+
+        if ( ! wp_next_scheduled( self::LICENSE_CRON_HOOK ) ) {
+            wp_schedule_event( time() + HOUR_IN_SECONDS, 'twicedaily', self::LICENSE_CRON_HOOK );
+        }
+    }
+
+    public static function deactivate() {
+        $timestamp = wp_next_scheduled( self::LICENSE_CRON_HOOK );
+        if ( $timestamp ) {
+            wp_unschedule_event( $timestamp, self::LICENSE_CRON_HOOK );
+        }
+    }
+
+    public function cron_refresh_plugin_license() {
+        $this->refresh_plugin_license( 'cron' );
+    }
+
+    private function default_license_state() {
+        return array(
+            'key'          => '',
+            'status'       => 'missing',
+            'type'         => '',
+            'valid_to'     => '',
+            'domain'       => '',
+            'message'      => '',
+            'last_check'   => 0,
+            'last_success' => 0,
+        );
+    }
+
+    private function get_license_state() {
+        $state = get_option( self::LICENSE_OPTION, array() );
+        if ( ! is_array( $state ) ) {
+            $state = array();
+        }
+        return wp_parse_args( $state, $this->default_license_state() );
+    }
+
+    private function update_license_state( $data ) {
+        $current = $this->get_license_state();
+        $new = array_merge( $current, is_array( $data ) ? $data : array() );
+        $new['key'] = sanitize_text_field( (string) ( $new['key'] ?? '' ) );
+        $new['status'] = sanitize_key( (string) ( $new['status'] ?? 'missing' ) );
+        $new['type'] = sanitize_key( (string) ( $new['type'] ?? '' ) );
+        $new['valid_to'] = sanitize_text_field( (string) ( $new['valid_to'] ?? '' ) );
+        $new['domain'] = sanitize_text_field( (string) ( $new['domain'] ?? '' ) );
+        $new['message'] = sanitize_text_field( (string) ( $new['message'] ?? '' ) );
+        $new['last_check'] = (int) ( $new['last_check'] ?? 0 );
+        $new['last_success'] = (int) ( $new['last_success'] ?? 0 );
+        update_option( self::LICENSE_OPTION, $new, false );
+    }
+
+    private function get_management_context() {
+        $guard_present = function_exists( 'sw_guard_get_service_state' );
+        $management_status = $guard_present ? (string) get_option( 'swg_management_status', 'NONE' ) : 'NONE';
+        $service_state = $guard_present ? (string) sw_guard_get_service_state( self::PLUGIN_SLUG ) : 'off';
+        $guard_last_success = $guard_present ? (int) get_option( 'swg_last_success_ts', 0 ) : 0;
+        $connected_recently = $guard_last_success > 0 && ( time() - $guard_last_success ) <= ( 8 * DAY_IN_SECONDS );
+
+        return array(
+            'guard_present'       => $guard_present,
+            'management_status'   => $management_status,
+            'service_state'       => in_array( $service_state, array( 'active', 'passive', 'off' ), true ) ? $service_state : 'off',
+            'guard_last_success'  => $guard_last_success,
+            'connected_recently'  => $connected_recently,
+            'is_active'           => $guard_present && $connected_recently && 'ACTIVE' === $management_status && 'active' === $service_state,
+        );
+    }
+
+    private function has_active_standalone_license() {
+        $license = $this->get_license_state();
+        return '' !== $license['key'] && 'active' === $license['status'] && 'plugin_single' === $license['type'];
+    }
+
+    private function plugin_is_operational() {
+        $management = $this->get_management_context();
+        if ( ! empty( $management['is_active'] ) ) {
+            return true;
+        }
+        return $this->has_active_standalone_license();
     }
 
     public function maybe_upgrade_db() {
@@ -202,9 +292,9 @@ final class SW_Price_Builder {
             return;
         }
 
-        wp_enqueue_style( 'swpb-admin', plugin_dir_url( __FILE__ ) . 'assets/css/admin.css', array(), self::VERSION );
+        wp_enqueue_style( 'swpb-admin', plugin_dir_url( __FILE__ ) . 'assets/css/admin.css', array(), file_exists( plugin_dir_path( __FILE__ ) . 'assets/css/admin.css' ) ? filemtime( plugin_dir_path( __FILE__ ) . 'assets/css/admin.css' ) : self::VERSION );
         wp_enqueue_script( 'jquery-ui-sortable' );
-        wp_enqueue_script( 'swpb-admin', plugin_dir_url( __FILE__ ) . 'assets/js/admin.js', array( 'jquery', 'jquery-ui-sortable' ), self::VERSION, true );
+        wp_enqueue_script( 'swpb-admin', plugin_dir_url( __FILE__ ) . 'assets/js/admin.js', array( 'jquery', 'jquery-ui-sortable' ), file_exists( plugin_dir_path( __FILE__ ) . 'assets/js/admin.js' ) ? filemtime( plugin_dir_path( __FILE__ ) . 'assets/js/admin.js' ) : self::VERSION, true );
 
         wp_localize_script(
             'swpb-admin',
@@ -213,8 +303,8 @@ final class SW_Price_Builder {
                 'ajaxUrl'            => admin_url( 'admin-ajax.php' ),
                 'nonce'              => wp_create_nonce( 'swpb_order' ),
                 'categoriesNonce'    => wp_create_nonce( 'swpb_get_categories' ),
-                'categoriesEmpty'    => __( 'Nejprve vyber ceník', 'sw-price-builder' ),
-                'categoriesChoose'   => __( 'Vyber kategorii', 'sw-price-builder' ),
+                'categoriesEmpty'    => __( 'Nejprve vyberte ceník', 'sw-price-builder' ),
+                'categoriesChoose'   => __( 'Vyberte kategorii', 'sw-price-builder' ),
                 'categoriesChooseAll'=> __( 'Všechny kategorie', 'sw-price-builder' ),
             )
         );
@@ -228,10 +318,10 @@ final class SW_Price_Builder {
         $settings = $this->get_settings();
 
         if ( '1' === $settings['load_frontend_css'] ) {
-            wp_enqueue_style( 'swpb-frontend', plugin_dir_url( __FILE__ ) . 'assets/css/frontend.css', array(), self::VERSION );
+            wp_enqueue_style( 'swpb-frontend', plugin_dir_url( __FILE__ ) . 'assets/css/frontend.css', array(), file_exists( plugin_dir_path( __FILE__ ) . 'assets/css/frontend.css' ) ? filemtime( plugin_dir_path( __FILE__ ) . 'assets/css/frontend.css' ) : self::VERSION );
         }
 
-        wp_enqueue_script( 'swpb-frontend', plugin_dir_url( __FILE__ ) . 'assets/js/frontend.js', array(), self::VERSION, true );
+        wp_enqueue_script( 'swpb-frontend', plugin_dir_url( __FILE__ ) . 'assets/js/frontend.js', array(), file_exists( plugin_dir_path( __FILE__ ) . 'assets/js/frontend.js' ) ? filemtime( plugin_dir_path( __FILE__ ) . 'assets/js/frontend.js' ) : self::VERSION, true );
         wp_localize_script(
             'swpb-frontend',
             'swpbFrontend',
@@ -254,6 +344,9 @@ final class SW_Price_Builder {
     }
 
     public function rest_render( WP_REST_Request $request ) {
+        if ( ! $this->plugin_is_operational() ) {
+            return new WP_REST_Response( '', 403 );
+        }
         nocache_headers();
         header( 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0' );
         header( 'Pragma: no-cache' );
@@ -272,6 +365,9 @@ final class SW_Price_Builder {
     }
 
     public function shortcode_pricelist( $atts ) {
+        if ( ! $this->plugin_is_operational() ) {
+            return '';
+        }
         $atts = shortcode_atts(
             array(
                 'id'       => 0,
@@ -306,6 +402,9 @@ final class SW_Price_Builder {
     }
 
     public function shortcode_updated( $atts ) {
+        if ( ! $this->plugin_is_operational() ) {
+            return '';
+        }
         $atts = shortcode_atts( array( 'id' => 0 ), $atts, 'sw_pricelist_updated' );
         $pricelist_id = absint( $atts['id'] );
         if ( ! $pricelist_id ) {
@@ -588,6 +687,10 @@ final class SW_Price_Builder {
         }
 
         $action = sanitize_text_field( wp_unslash( $_POST['swpb_action'] ) );
+
+        if ( ! $this->plugin_is_operational() ) {
+            $this->redirect_with_notice( isset( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : 'swpb_dashboard', 'error', 'Plugin momentálně nemá platnou licenci. Změny nebyly uloženy.' );
+        }
         $nonce_action = 'swpb_' . $action;
         if ( empty( $_POST['_wpnonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ), $nonce_action ) ) {
             wp_die( esc_html__( 'Neplatný bezpečnostní token.', 'sw-price-builder' ) );
@@ -922,6 +1025,288 @@ final class SW_Price_Builder {
         return ! empty( $data['Version'] ) ? $data['Version'] : self::VERSION;
     }
 
+
+    public function add_plugin_action_links( $links ) {
+        $url = admin_url( 'admin.php?page=swpb_settings' );
+        array_unshift( $links, '<a href="' . esc_url( $url ) . '">' . esc_html__( 'Nastavení', 'sw-price-builder' ) . '</a>' );
+
+        $management = $this->get_management_context();
+        if ( ! empty( $management['is_active'] ) && isset( $links['deactivate'] ) ) {
+            unset( $links['deactivate'] );
+        }
+
+        return $links;
+    }
+
+    public function block_direct_deactivate() {
+        if ( ! is_admin() || ! current_user_can( 'activate_plugins' ) ) {
+            return;
+        }
+
+        if ( empty( $_GET['action'] ) || 'deactivate' !== $_GET['action'] ) {
+            return;
+        }
+
+        if ( empty( $_GET['plugin'] ) || plugin_basename( __FILE__ ) !== wp_unslash( $_GET['plugin'] ) ) {
+            return;
+        }
+
+        $management = $this->get_management_context();
+        if ( empty( $management['is_active'] ) ) {
+            return;
+        }
+
+        wp_die(
+            esc_html__( 'Tento plugin nelze deaktivovat, protože je aktivní v rámci Správy webu.', 'sw-price-builder' ),
+            esc_html__( 'Deaktivace není povolena', 'sw-price-builder' ),
+            array( 'response' => 403, 'back_link' => true )
+        );
+    }
+
+    public function maybe_refresh_plugin_license() {
+        if ( ! is_admin() || ! current_user_can( 'manage_options' ) ) {
+            return;
+        }
+
+        $license = $this->get_license_state();
+        if ( empty( $license['key'] ) ) {
+            return;
+        }
+
+        if ( ! empty( $license['last_check'] ) && ( time() - (int) $license['last_check'] ) < DAY_IN_SECONDS ) {
+            return;
+        }
+
+        $this->refresh_plugin_license( 'admin' );
+    }
+
+    private function refresh_plugin_license( $context = 'manual' ) {
+        $license = $this->get_license_state();
+        $key = trim( (string) $license['key'] );
+
+        if ( '' === $key ) {
+            $this->update_license_state(
+                array(
+                    'status'     => 'missing',
+                    'type'       => '',
+                    'valid_to'   => '',
+                    'domain'     => '',
+                    'message'    => '',
+                    'last_check' => time(),
+                )
+            );
+            return $this->get_license_state();
+        }
+
+        $domain = wp_parse_url( home_url(), PHP_URL_HOST );
+        $response = wp_remote_post(
+            trailingslashit( self::HUB_BASE ) . 'wp-json/sw-licence/v1/validate',
+            array(
+                'timeout' => 'cron' === $context ? 20 : 15,
+                'body'    => array(
+                    'license_key' => $key,
+                    'domain'      => (string) $domain,
+                    'plugin_slug' => self::PLUGIN_SLUG,
+                ),
+            )
+        );
+
+        $state = array(
+            'key'        => $key,
+            'last_check' => time(),
+        );
+
+        if ( is_wp_error( $response ) ) {
+            $state['status'] = 'error';
+            $state['message'] = $response->get_error_message();
+            $this->update_license_state( $state );
+            return $this->get_license_state();
+        }
+
+        $code = (int) wp_remote_retrieve_response_code( $response );
+        $body = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( ! is_array( $body ) ) {
+            $body = array();
+        }
+
+        $is_active = ( 200 === $code ) && ! empty( $body['valid'] );
+        $state['status'] = $is_active ? 'active' : 'inactive';
+        $state['type'] = sanitize_key( (string) ( $body['license_type'] ?? 'plugin_single' ) );
+        $state['valid_to'] = sanitize_text_field( (string) ( $body['valid_to'] ?? '' ) );
+        $state['domain'] = sanitize_text_field( (string) ( $body['domain'] ?? (string) $domain ) );
+        $state['message'] = sanitize_text_field( (string) ( $body['message'] ?? '' ) );
+        if ( $is_active ) {
+            $state['last_success'] = time();
+        }
+
+        $this->update_license_state( $state );
+        return $this->get_license_state();
+    }
+
+    public function handle_verify_license() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_die( esc_html__( 'Nemáte oprávnění.', 'sw-price-builder' ) );
+        }
+
+        check_admin_referer( 'swpb_verify_license' );
+        $key = isset( $_POST['license_key'] ) ? sanitize_text_field( wp_unslash( $_POST['license_key'] ) ) : '';
+        $this->update_license_state(
+            array(
+                'key'          => $key,
+                'status'       => '' === $key ? 'missing' : 'inactive',
+                'type'         => '',
+                'valid_to'     => '',
+                'domain'       => '',
+                'message'      => '',
+                'last_check'   => 0,
+                'last_success' => 0,
+            )
+        );
+        $license = $this->refresh_plugin_license( 'manual' );
+        $message = ( 'active' === $license['status'] ) ? 'Licence byla ověřena.' : ( ! empty( $license['message'] ) ? $license['message'] : 'Licenci se nepodařilo ověřit.' );
+        wp_safe_redirect( add_query_arg( array( 'page' => 'swpb_dashboard', 'swpb_notice' => rawurlencode( $message ), 'swpb_type' => ( 'active' === $license['status'] ? 'success' : 'error' ) ), admin_url( 'admin.php' ) ) );
+        exit;
+    }
+
+    public function handle_remove_license() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_die( esc_html__( 'Nemáte oprávnění.', 'sw-price-builder' ) );
+        }
+
+        check_admin_referer( 'swpb_remove_license' );
+        $this->update_license_state( $this->default_license_state() );
+        wp_safe_redirect( add_query_arg( array( 'page' => 'swpb_dashboard', 'swpb_notice' => rawurlencode( 'Licenční kód byl odebrán.' ), 'swpb_type' => 'success' ), admin_url( 'admin.php' ) ) );
+        exit;
+    }
+
+    private function get_license_panel_data( $license, $management, $is_operational ) {
+        $format_dt = static function( $ts ) {
+            return $ts > 0 ? wp_date( 'j. n. Y H:i', $ts ) : '—';
+        };
+        $format_date = static function( $ymd ) {
+            if ( '' === $ymd ) {
+                return '—';
+            }
+            $ts = strtotime( $ymd . ' 12:00:00' );
+            return $ts ? wp_date( 'j. n. Y', $ts ) : $ymd;
+        };
+
+        $base = array(
+            'badge_class' => 'inactive',
+            'badge_label' => 'Licence chybí',
+            'mode'        => 'Samostatná licence pluginu',
+            'subline'     => '',
+            'valid_to'    => '—',
+            'domain'      => '',
+            'last_check'  => '—',
+            'message'     => '',
+        );
+
+        if ( ! empty( $management['guard_present'] ) ) {
+            if ( ! empty( $management['is_active'] ) ) {
+                return array_merge( $base, array(
+                    'badge_class' => 'active',
+                    'badge_label' => 'Platná licence',
+                    'mode'        => 'Správa webu',
+                    'valid_to'    => $format_date( (string) get_option( 'swg_managed_until', '' ) ),
+                    'domain'      => (string) get_option( 'swg_licence_domain', '' ),
+                    'last_check'  => $format_dt( (int) $management['guard_last_success'] ),
+                ) );
+            }
+            if ( 'NONE' !== $management['management_status'] ) {
+                return array_merge( $base, array(
+                    'badge_class' => 'inactive',
+                    'badge_label' => 'Licence neplatná',
+                    'mode'        => 'Správa webu',
+                    'subline'     => 'Správa webu je po expiraci nebo omezená.',
+                    'valid_to'    => $format_date( (string) get_option( 'swg_managed_until', '' ) ),
+                    'domain'      => (string) get_option( 'swg_licence_domain', '' ),
+                    'last_check'  => $format_dt( (int) $management['guard_last_success'] ),
+                    'message'     => 'Po expiraci lze plugin deaktivovat nebo smazat.',
+                ) );
+            }
+        }
+
+        if ( 'active' === $license['status'] ) {
+            return array_merge( $base, array(
+                'badge_class' => 'active',
+                'badge_label' => 'Platná licence',
+                'mode'        => 'Samostatná licence pluginu',
+                'subline'     => '' !== $license['key'] ? 'Licenční kód: ' . $license['key'] : '',
+                'valid_to'    => $format_date( (string) $license['valid_to'] ),
+                'domain'      => (string) $license['domain'],
+                'last_check'  => $format_dt( (int) $license['last_success'] ),
+                'message'     => '' !== $license['message'] ? $license['message'] : 'Plugin běží přes samostatnou licenci.',
+            ) );
+        }
+
+        return array_merge( $base, array(
+            'badge_class' => $is_operational ? 'active' : 'inactive',
+            'badge_label' => $is_operational ? 'Platná licence' : 'Licence chybí',
+            'subline'     => '' !== $license['key'] ? 'Licenční kód: ' . $license['key'] : 'Zatím nebyl uložen žádný licenční kód.',
+            'valid_to'    => $format_date( (string) $license['valid_to'] ),
+            'domain'      => (string) $license['domain'],
+            'last_check'  => $format_dt( (int) $license['last_check'] ),
+            'message'     => '' !== $license['message'] ? $license['message'] : 'Bez platné licence plugin přestává fungovat na frontendu i při ukládání změn.',
+        ) );
+    }
+
+    private function render_license_panel() {
+        $license = $this->get_license_state();
+        $management = $this->get_management_context();
+        $is_operational = $this->plugin_is_operational();
+        $status = $this->get_license_panel_data( $license, $management, $is_operational );
+        ?>
+        <div class="swpb-panel swpb-panel--licence">
+            <div class="swpb-card__head">
+                <div>
+                    <h2><?php echo esc_html__( 'Licence pluginu', 'sw-price-builder' ); ?></h2>
+                    <p class="swpb-muted"><?php echo esc_html__( 'Plugin může běžet buď v rámci platné správy webu, nebo přes samostatnou licenci.', 'sw-price-builder' ); ?></p>
+                </div>
+                <span class="swpb-licence-badge swpb-licence-badge--<?php echo esc_attr( $status['badge_class'] ); ?>"><?php echo esc_html( $status['badge_label'] ); ?></span>
+            </div>
+
+            <div class="swpb-licence-grid">
+                <div class="swpb-licence-item">
+                    <span class="swpb-licence-label"><?php esc_html_e( 'Režim', 'sw-price-builder' ); ?></span>
+                    <strong><?php echo esc_html( $status['mode'] ); ?></strong>
+                    <?php if ( ! empty( $status['subline'] ) ) : ?><span><?php echo esc_html( $status['subline'] ); ?></span><?php endif; ?>
+                </div>
+                <div class="swpb-licence-item">
+                    <span class="swpb-licence-label"><?php esc_html_e( 'Platnost do', 'sw-price-builder' ); ?></span>
+                    <strong><?php echo esc_html( $status['valid_to'] ); ?></strong>
+                    <?php if ( ! empty( $status['domain'] ) ) : ?><span><?php echo esc_html( $status['domain'] ); ?></span><?php endif; ?>
+                </div>
+                <div class="swpb-licence-item">
+                    <span class="swpb-licence-label"><?php esc_html_e( 'Poslední ověření', 'sw-price-builder' ); ?></span>
+                    <strong><?php echo esc_html( $status['last_check'] ); ?></strong>
+                    <?php if ( ! empty( $status['message'] ) ) : ?><span><?php echo esc_html( $status['message'] ); ?></span><?php endif; ?>
+                </div>
+            </div>
+
+            <?php if ( empty( $management['is_active'] ) ) : ?>
+                <div class="swpb-license-form-wrap">
+                    <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="swpb-license-form">
+                        <?php wp_nonce_field( 'swpb_verify_license' ); ?>
+                        <input type="hidden" name="action" value="swpb_verify_license">
+                        <label for="swpb_license_key"><strong><?php esc_html_e( 'Licenční kód pluginu', 'sw-price-builder' ); ?></strong></label>
+                        <input type="text" id="swpb_license_key" name="license_key" value="<?php echo esc_attr( $license['key'] ); ?>" class="regular-text" placeholder="SWLIC-...">
+                        <p class="description"><?php esc_html_e( 'Použijte pouze pro samostatnou licenci pluginu. Pokud máte Správu webu, kód vyplňovat nemusíte.', 'sw-price-builder' ); ?></p>
+                        <div class="swpb-license-actions">
+                            <button type="submit" class="button button-primary"><?php esc_html_e( 'Ověřit a uložit licenci', 'sw-price-builder' ); ?></button>
+                            <?php if ( '' !== $license['key'] ) : ?>
+                                <a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin-post.php?action=swpb_remove_license' ), 'swpb_remove_license' ) ); ?>" class="button button-secondary"><?php esc_html_e( 'Odebrat licenční kód', 'sw-price-builder' ); ?></a>
+                            <?php endif; ?>
+                        </div>
+                    </form>
+                </div>
+            <?php else : ?>
+                <div class="swpb-note"><?php esc_html_e( 'Plugin je provozován v rámci Správy webu. Samostatný licenční kód není potřeba.', 'sw-price-builder' ); ?></div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
     private function render_admin_hero( $title, $description, $compact = false ) {
         ?>
         <div class="swpb-hero<?php echo $compact ? ' swpb-hero--compact' : ''; ?>">
@@ -942,6 +1327,7 @@ final class SW_Price_Builder {
 
     public function render_dashboard_page() {
         global $wpdb;
+        $can_edit_settings = $this->plugin_is_operational();
         $counts = array(
             'pricelists' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$this->table_pricelists}" ),
             'categories' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$this->table_categories}" ),
@@ -951,6 +1337,8 @@ final class SW_Price_Builder {
         <div class="wrap swpb-admin-wrap">
             <?php $this->render_notice(); ?>
             <?php $this->render_admin_hero( 'Ceníky', 'Univerzální builder ceníků pro služby, produkty i balíčky. Plugin umí více ceníků na jednom webu, podporuje kategorie a je připravený i pro weby s agresivní cache nebo Varnishem.' ); ?>
+            <?php $this->render_license_panel(); ?>
+            <?php if ( ! $can_edit_settings ) : ?><div class="notice notice-warning"><p><?php echo esc_html__( 'Plugin momentálně nemá platnou licenci. Nastavení zůstává pouze pro čtení a frontend výstup je vypnutý.', 'sw-price-builder' ); ?></p></div><?php endif; ?>
 
             <div class="swpb-cards-grid swpb-cards-grid--stats">
                 <div class="swpb-card"><span class="swpb-card-label">Ceníky</span><strong><?php echo (int) $counts['pricelists']; ?></strong></div>
@@ -968,11 +1356,11 @@ final class SW_Price_Builder {
                 </section>
                 <section class="swpb-panel">
                     <h2>Doporučení</h2>
-                    <ul class="swpb-list-clean">
-                        <li>Pro weby s Varnishem nebo agresivní page cache používej dynamický režim.</li>
-                        <li>Pokud si chceš vzhled řešit po svém, vypni výchozí frontend CSS.</li>
-                        <li>Pro služby a tarify se hodí layout karty, pro klasické ceníky tabulka.</li>
-                    </ul>
+                    <p>
+                        Pro weby s Varnishem nebo agresivní page cache používejte dynamický režim.<br>
+                        Pokud si chcete vzhled řešit po svém, vypněte výchozí frontend CSS.</br>
+                        Pro služby a tarify se hodí layout karty, pro klasické ceníky tabulka.
+                    </p>
                 </section>
             </div>
         </div>
@@ -981,17 +1369,21 @@ final class SW_Price_Builder {
 
     public function render_pricelists_page() {
         global $wpdb;
+        $can_edit_settings = $this->plugin_is_operational();
         $edit_id = isset( $_GET['edit'] ) ? absint( $_GET['edit'] ) : 0;
         $pricelist = $edit_id ? $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$this->table_pricelists} WHERE id = %d", $edit_id ) ) : null;
         $pricelists = $this->get_pricelists();
         ?>
         <div class="wrap swpb-admin-wrap">
             <?php $this->render_notice(); ?>
-            <?php $this->render_admin_hero( 'Ceníky', 'Zde vytvoříš jednotlivé ceníky a nastavíš jejich základní výchozí chování.', true ); ?>
+            <?php $this->render_admin_hero( 'Ceníky', 'Zde vytvoříte jednotlivé ceníky a nastavíte jejich základní výchozí chování.', true ); ?>
+            <?php $this->render_license_panel(); ?>
+            <?php if ( ! $can_edit_settings ) : ?><div class="notice notice-warning"><p><?php echo esc_html__( 'Plugin momentálně nemá platnou licenci. Nastavení zůstává pouze pro čtení a frontend výstup je vypnutý.', 'sw-price-builder' ); ?></p></div><?php endif; ?>
             <div class="swpb-admin-grid">
                 <section class="swpb-panel">
                     <h2><?php echo $pricelist ? 'Upravit ceník' : 'Nový ceník'; ?></h2>
-                    <form method="post" class="swpb-form-grid">
+                    <form method="post" class="swpb-form-grid <?php echo $can_edit_settings ? "" : "is-readonly"; ?>">
+                        <fieldset <?php disabled( ! $can_edit_settings ); ?>>
                         <?php wp_nonce_field( 'swpb_save_pricelist' ); ?>
                         <input type="hidden" name="swpb_action" value="save_pricelist">
                         <input type="hidden" name="id" value="<?php echo $pricelist ? (int) $pricelist->id : 0; ?>">
@@ -1004,7 +1396,8 @@ final class SW_Price_Builder {
                         <label><span>Text bez ceny</span><input type="text" name="empty_price_text" value="<?php echo esc_attr( $pricelist->empty_price_text ?? 'Na dotaz' ); ?>"></label>
                         <label><span>Wrapper class</span><input type="text" name="css_class" value="<?php echo esc_attr( $pricelist->css_class ?? '' ); ?>"></label>
                         <label class="swpb-checkbox"><input type="checkbox" name="is_active" value="1" <?php checked( isset( $pricelist->is_active ) ? $pricelist->is_active : 1, 1 ); ?>> <span>Ceník je aktivní</span></label>
-                        <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary">Uložit ceník</button></div>
+                        <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary" <?php disabled( ! $can_edit_settings ); ?>>Uložit ceník</button></div>
+                        </fieldset>
                     </form>
                 </section>
                 <section class="swpb-panel">
@@ -1044,6 +1437,7 @@ final class SW_Price_Builder {
 
     public function render_categories_page() {
         global $wpdb;
+        $can_edit_settings = $this->plugin_is_operational();
         $selected_pricelist = isset( $_GET['pricelist_id'] ) ? absint( $_GET['pricelist_id'] ) : 0;
         $edit_id = isset( $_GET['edit'] ) ? absint( $_GET['edit'] ) : 0;
         $category = $edit_id ? $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$this->table_categories} WHERE id = %d", $edit_id ) ) : null;
@@ -1056,30 +1450,32 @@ final class SW_Price_Builder {
         ?>
         <div class="wrap swpb-admin-wrap">
             <?php $this->render_notice(); ?>
-            <div class="swpb-hero swpb-hero--compact"><div><h1>Kategorie</h1><p>U jednoho ceníku můžeš mít hlavní kategorie i podkategorie. Pořadí lze měnit přetažením.</p></div></div>
+            <div class="swpb-hero swpb-hero--compact"><div><h1>Kategorie</h1><p>U jednoho ceníku můžete mít hlavní kategorie i podkategorie. Pořadí lze měnit přetažením.</p></div></div>
             <form method="get" class="swpb-filter-bar">
                 <input type="hidden" name="page" value="swpb_categories">
-                <label><span>Ceník</span><select name="pricelist_id" onchange="this.form.submit()"><option value="0">Vyber ceník</option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist, (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
+                <label><span>Ceník</span><select name="pricelist_id" onchange="this.form.submit()"><option value="0">Vyberte ceník </option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist, (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
             </form>
             <div class="swpb-admin-grid">
                 <section class="swpb-panel">
                     <h2><?php echo $category ? 'Upravit kategorii' : 'Nová kategorie'; ?></h2>
-                    <form method="post" class="swpb-form-grid">
+                    <form method="post" class="swpb-form-grid <?php echo $can_edit_settings ? "" : "is-readonly"; ?>">
+                        <fieldset <?php disabled( ! $can_edit_settings ); ?>>
                         <?php wp_nonce_field( 'swpb_save_category' ); ?>
                         <input type="hidden" name="swpb_action" value="save_category">
                         <input type="hidden" name="id" value="<?php echo $category ? (int) $category->id : 0; ?>">
-                        <label><span>Ceník</span><select name="pricelist_id" required><option value="">Vyber ceník</option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist ? $selected_pricelist : (int) ( $category->pricelist_id ?? 0 ), (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
+                        <label><span>Ceník</span><select name="pricelist_id" required><option value="">Vyberte ceník</option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist ? $selected_pricelist : (int) ( $category->pricelist_id ?? 0 ), (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
                         <label><span>Nadřazená kategorie</span><select name="parent_id"><option value="0">Bez nadřazené kategorie</option><?php foreach ( $top as $cat ) : ?><option value="<?php echo (int) $cat->id; ?>" <?php selected( $category->parent_id ?? 0, (int) $cat->id ); ?>><?php echo esc_html( $cat->name ); ?></option><?php endforeach; ?></select></label>
                         <label><span>Název</span><input type="text" name="name" value="<?php echo esc_attr( $category->name ?? '' ); ?>" required></label>
                         <label class="swpb-field-full"><span>Popis</span><textarea name="description" rows="4"><?php echo esc_textarea( $category->description ?? '' ); ?></textarea></label>
                         <label class="swpb-checkbox"><input type="checkbox" name="is_active" value="1" <?php checked( isset( $category->is_active ) ? $category->is_active : 1, 1 ); ?>> <span>Kategorie je aktivní</span></label>
-                        <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary">Uložit kategorii</button></div>
+                        <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary" <?php disabled( ! $can_edit_settings ); ?>>Uložit kategorii</button></div>
+                        </fieldset>
                     </form>
                 </section>
                 <section class="swpb-panel">
                     <h2>Struktura kategorií</h2>
                     <?php if ( ! $selected_pricelist ) : ?>
-                        <p>Nejprve vyber ceník.</p>
+                        <p>Nejprve vyberte ceník.</p>
                     <?php else : ?>
                         <ul class="swpb-sortable-tree" id="swpb-category-tree">
                             <?php foreach ( $top as $cat ) : ?>
@@ -1105,6 +1501,7 @@ final class SW_Price_Builder {
 
     public function render_items_page() {
         global $wpdb;
+        $can_edit_settings = $this->plugin_is_operational();
         $selected_pricelist = isset( $_GET['pricelist_id'] ) ? absint( $_GET['pricelist_id'] ) : 0;
         $selected_category  = isset( $_GET['category_id'] ) ? absint( $_GET['category_id'] ) : 0;
         $edit_id = isset( $_GET['edit'] ) ? absint( $_GET['edit'] ) : 0;
@@ -1119,20 +1516,21 @@ final class SW_Price_Builder {
         ?>
         <div class="wrap swpb-admin-wrap">
             <?php $this->render_notice(); ?>
-            <div class="swpb-hero swpb-hero--compact"><div><h1>Položky</h1><p>Položky lze řadit přetažením v rámci konkrétní kategorie. Kromě číselné ceny můžeš použít i vlastní text, například „Na dotaz“ nebo „Dle rozsahu“.</p></div></div>
+            <div class="swpb-hero swpb-hero--compact"><div><h1>Položky</h1><p>Položky lze řadit přetažením v rámci konkrétní kategorie. Kromě číselné ceny můžete použít i vlastní text, například „Na dotaz“ nebo „Dle rozsahu“.</p></div></div>
             <form method="get" class="swpb-filter-bar swpb-filter-bar--double">
                 <input type="hidden" name="page" value="swpb_items">
-                <label><span>Ceník</span><select name="pricelist_id" onchange="this.form.submit()"><option value="0">Vyber ceník</option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist, (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
+                <label><span>Ceník</span><select name="pricelist_id" onchange="this.form.submit()"><option value="0">Vyberte ceník</option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist, (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
                 <label><span>Kategorie</span><select name="category_id" onchange="this.form.submit()"><option value="0">Všechny kategorie</option><?php foreach ( $categories as $cat ) : ?><option value="<?php echo (int) $cat->id; ?>" <?php selected( $selected_category, (int) $cat->id ); ?>><?php echo esc_html( ( (int) $cat->parent_id > 0 ? "— " : "" ) . $cat->name ); ?></option><?php endforeach; ?></select></label>
             </form>
             <div class="swpb-admin-grid swpb-admin-grid--wide">
                 <section class="swpb-panel">
                     <h2><?php echo $item ? 'Upravit položku' : 'Nová položka'; ?></h2>
-                    <form method="post" class="swpb-form-grid swpb-item-form">
+                    <form method="post" class="swpb-form-grid swpb-item-form <?php echo $can_edit_settings ? "" : "is-readonly"; ?>">
+                        <fieldset <?php disabled( ! $can_edit_settings ); ?>>
                         <?php wp_nonce_field( 'swpb_save_item' ); ?>
                         <input type="hidden" name="swpb_action" value="save_item">
                         <input type="hidden" name="id" value="<?php echo $item ? (int) $item->id : 0; ?>">
-                        <label><span>Ceník</span><select name="pricelist_id" class="swpb-item-pricelist" required><option value="">Vyber ceník</option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist, (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
+                        <label><span>Ceník</span><select name="pricelist_id" class="swpb-item-pricelist" required><option value="">Vyberte ceník</option><?php foreach ( $pricelists as $pricelist_row ) : ?><option value="<?php echo (int) $pricelist_row->id; ?>" <?php selected( $selected_pricelist, (int) $pricelist_row->id ); ?>><?php echo esc_html( $pricelist_row->name ); ?></option><?php endforeach; ?></select></label>
                         <label><span>Kategorie</span><select name="category_id" class="swpb-item-category" data-selected="<?php echo (int) $selected_category; ?>" required><option value="">Vyber kategorii</option><?php foreach ( $categories as $cat ) : ?><option value="<?php echo (int) $cat->id; ?>" <?php selected( $selected_category, (int) $cat->id ); ?>><?php echo esc_html( ( (int) $cat->parent_id > 0 ? "— " : "" ) . $cat->name ); ?></option><?php endforeach; ?></select></label>
                         <label class="swpb-field-full"><span>Název položky</span><input type="text" name="name" value="<?php echo esc_attr( $item->name ?? '' ); ?>" required></label>
                         <label><span>Kód</span><input type="text" name="code" value="<?php echo esc_attr( $item->code ?? '' ); ?>"></label>
@@ -1149,7 +1547,8 @@ final class SW_Price_Builder {
                         <label class="swpb-checkbox"><input type="checkbox" name="include_in_range" value="1" <?php checked( isset( $item->include_in_range ) ? $item->include_in_range : 1, 1 ); ?>> <span>Zahrnout do budoucího výpočtu rozsahu cen</span></label>
                         <label class="swpb-checkbox"><input type="checkbox" name="is_featured" value="1" <?php checked( isset( $item->is_featured ) ? $item->is_featured : 0, 1 ); ?>> <span>Zvýrazněná položka</span></label>
                         <label class="swpb-checkbox"><input type="checkbox" name="is_active" value="1" <?php checked( isset( $item->is_active ) ? $item->is_active : 1, 1 ); ?>> <span>Položka je aktivní</span></label>
-                        <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary">Uložit položku</button></div>
+                        <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary" <?php disabled( ! $can_edit_settings ); ?>>Uložit položku</button></div>
+                        </fieldset>
                     </form>
                 </section>
                 <section class="swpb-panel">
@@ -1183,7 +1582,7 @@ final class SW_Price_Builder {
                             </tbody>
                         </table>
                     </div>
-                    <?php if ( ! $selected_category ) : ?><p class="description">Pro přetažení pořadí položek vyber konkrétní kategorii.</p><?php endif; ?>
+                    <?php if ( ! $selected_category ) : ?><p class="description">Pro přetažení pořadí položek vyberte konkrétní kategorii.</p><?php endif; ?>
                 </section>
             </div>
         </div>
@@ -1192,19 +1591,24 @@ final class SW_Price_Builder {
 
     public function render_settings_page() {
         $settings = $this->get_settings();
+        $can_edit_settings = $this->plugin_is_operational();
         ?>
         <div class="wrap swpb-admin-wrap">
             <?php $this->render_notice(); ?>
             <?php $this->render_admin_hero( 'Nastavení', 'Globální nastavení pluginu. Klíčové je hlavně chování výstupu na frontendu a práce s výchozím CSS.', true ); ?>
+            <?php $this->render_license_panel(); ?>
+            <?php if ( ! $can_edit_settings ) : ?><div class="notice notice-warning"><p><?php echo esc_html__( 'Plugin momentálně nemá platnou licenci. Nastavení zůstává pouze pro čtení a frontend výstup je vypnutý.', 'sw-price-builder' ); ?></p></div><?php endif; ?>
             <section class="swpb-panel swpb-panel--narrow">
-                <form method="post" class="swpb-form-grid">
+                <form method="post" class="swpb-form-grid <?php echo $can_edit_settings ? "" : "is-readonly"; ?>">
+                        <fieldset <?php disabled( ! $can_edit_settings ); ?>>
                     <?php wp_nonce_field( 'swpb_save_settings' ); ?>
                     <input type="hidden" name="swpb_action" value="save_settings">
                     <label><span>Režim výstupu</span><select name="frontend_mode"><option value="dynamic" <?php selected( $settings['frontend_mode'], 'dynamic' ); ?>>Dynamický přes REST endpoint bez cache</option><option value="direct" <?php selected( $settings['frontend_mode'], 'direct' ); ?>>Přímý HTML výstup</option></select></label>
                     <label class="swpb-checkbox"><input type="checkbox" name="load_frontend_css" value="1" <?php checked( $settings['load_frontend_css'], '1' ); ?>> <span>Načítat výchozí frontend CSS pluginu</span></label>
                     <label class="swpb-checkbox"><input type="checkbox" name="show_codes" value="1" <?php checked( $settings['show_codes'], '1' ); ?>> <span>Zobrazovat kód položky v tabulkovém layoutu</span></label>
                     <label class="swpb-checkbox"><input type="checkbox" name="show_update_date" value="1" <?php checked( $settings['show_update_date'], '1' ); ?>> <span>Zobrazovat datum poslední aktualizace ceníku</span></label>
-                    <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary">Uložit nastavení</button></div>
+                    <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary" <?php disabled( ! $can_edit_settings ); ?>>Uložit nastavení</button></div>
+                    </fieldset>
                 </form>
             </section>
         </div>
