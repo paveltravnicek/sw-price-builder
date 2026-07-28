@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Tvorba ceníků
  * Description: Univerzální builder ceníků s podporou více ceníků, kategorií, položek a dynamického výstupu odolného vůči cache.
- * Version: 1.0
+ * Version: 1.1
  * Author: Smart Websites
  * Author URI: https://smart-websites.cz
  * Update URI: https://github.com/paveltravnicek/sw-price-builder/
@@ -40,7 +40,7 @@ final class SW_Price_Builder {
     const REST_NAMESPACE = 'sw-price-builder/v1';
     const LICENSE_OPTION = 'swpb_license';
     const LICENSE_CRON_HOOK = 'swpb_license_daily_check';
-    const HUB_BASE = 'https://smart-websites.cz';
+    const HUB_BASE = 'https://agent.smart-websites.cz';
     const PLUGIN_SLUG = 'sw-price-builder';
 
     private static $instance = null;
@@ -1099,15 +1099,22 @@ final class SW_Price_Builder {
         }
 
         $domain = wp_parse_url( home_url(), PHP_URL_HOST );
+        $site_id = (string) get_option( 'swg_site_id', '' );
+        $payload = array(
+            'license_key'    => $key,
+            'plugin_slug'    => self::PLUGIN_SLUG,
+            'site_id'        => $site_id,
+            'site_url'       => home_url( '/' ),
+            'reason'         => $context,
+            'plugin_version' => $this->get_plugin_version(),
+        );
+
         $response = wp_remote_post(
-            trailingslashit( self::HUB_BASE ) . 'wp-json/sw-licence/v1/validate',
+            rtrim( self::HUB_BASE, '/' ) . '/index.php?api=swlic/v2/plugin-license',
             array(
                 'timeout' => 'cron' === $context ? 20 : 15,
-                'body'    => array(
-                    'license_key' => $key,
-                    'domain'      => (string) $domain,
-                    'plugin_slug' => self::PLUGIN_SLUG,
-                ),
+                'headers' => array( 'Content-Type' => 'application/json' ),
+                'body'    => wp_json_encode( $payload, JSON_UNESCAPED_SLASHES ),
             )
         );
 
@@ -1129,11 +1136,20 @@ final class SW_Price_Builder {
             $body = array();
         }
 
-        $is_active = ( 200 === $code ) && ! empty( $body['valid'] );
+        if ( $code < 200 || $code >= 300 || empty( $body ) ) {
+            $state['status'] = 'error';
+            $state['message'] = ! empty( $body['message'] )
+                ? sanitize_text_field( (string) $body['message'] )
+                : ( $code > 0 ? 'Agent vrátil neočekávanou odpověď (HTTP ' . $code . ').' : 'Nepodařilo se ověřit licenci.' );
+            $this->update_license_state( $state );
+            return $this->get_license_state();
+        }
+
+        $is_active = ! empty( $body['ok'] ) && 'active' === (string) ( $body['status'] ?? '' );
         $state['status'] = $is_active ? 'active' : 'inactive';
-        $state['type'] = sanitize_key( (string) ( $body['license_type'] ?? 'plugin_single' ) );
+        $state['type'] = sanitize_key( (string) ( $body['licence_type'] ?? 'plugin_single' ) );
         $state['valid_to'] = sanitize_text_field( (string) ( $body['valid_to'] ?? '' ) );
-        $state['domain'] = sanitize_text_field( (string) ( $body['domain'] ?? (string) $domain ) );
+        $state['domain'] = sanitize_text_field( (string) ( $body['assigned_domain'] ?? (string) $domain ) );
         $state['message'] = sanitize_text_field( (string) ( $body['message'] ?? '' ) );
         if ( $is_active ) {
             $state['last_success'] = time();
