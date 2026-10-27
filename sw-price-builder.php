@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Tvorba ceníků
- * Description: Univerzální builder ceníků s podporou více ceníků, kategorií, položek a dynamického výstupu odolného vůči cache.
- * Version: 1.1
+ * Description: Univerzální builder ceníků s podporou více ceníků, kategorií a položek. Ceník je vždy přímo v HTML (SEO/AI), v dynamickém režimu se navíc tiše obnoví přes REST; při změně se čistí cache (WP Compress, volitelně Varnish).
+ * Version: 1.2
  * Author: Smart Websites
  * Author URI: https://smart-websites.cz
  * Update URI: https://github.com/paveltravnicek/sw-price-builder/
@@ -33,7 +33,7 @@ if ( ! class_exists( 'SW_Price_Builder' ) ) {
 
 final class SW_Price_Builder {
 
-    const VERSION = '1.0';
+    const VERSION = '1.2';
     const OPTION_SETTINGS = 'swpb_settings';
     const OPTION_DB_VERSION = 'swpb_db_version';
     const DB_VERSION = '0.1.0';
@@ -262,6 +262,7 @@ final class SW_Price_Builder {
             'load_frontend_css'  => '1',
             'show_codes'         => '0',
             'show_update_date'   => '1',
+            'purge_varnish'      => '0',
         );
     }
 
@@ -385,20 +386,24 @@ final class SW_Price_Builder {
 
         $settings = $this->get_settings();
 
-        if ( 'dynamic' === $settings['frontend_mode'] ) {
-            return sprintf(
-                '<div class="swpb-dynamic-placeholder" data-pricelist="%1$d" data-category="%2$d" data-layout="%3$s"><div class="swpb-loading">%4$s</div></div>',
-                $pricelist_id,
-                absint( $atts['category'] ),
-                esc_attr( sanitize_key( (string) $atts['layout'] ) ),
-                esc_html__( 'Načítám ceník…', 'sw-price-builder' )
-            );
-        }
-
-        return $this->render_pricelist( $pricelist_id, array(
+        // Ceník je vždy rovnou v HTML (vidí ho vyhledávače i AI, nic neposkakuje).
+        $html = $this->render_pricelist( $pricelist_id, array(
             'category' => absint( $atts['category'] ),
             'layout'   => sanitize_key( (string) $atts['layout'] ),
         ) );
+
+        // Dynamický režim: obal pro tichou obnovu přes REST (kdyby stránka přišla ze starší cache).
+        if ( 'dynamic' === $settings['frontend_mode'] ) {
+            return sprintf(
+                '<div class="swpb-dynamic-placeholder" data-pricelist="%1$d" data-category="%2$d" data-layout="%3$s">%4$s</div>',
+                $pricelist_id,
+                absint( $atts['category'] ),
+                esc_attr( sanitize_key( (string) $atts['layout'] ) ),
+                $html
+            );
+        }
+
+        return $html;
     }
 
     public function shortcode_updated( $atts ) {
@@ -417,7 +422,14 @@ final class SW_Price_Builder {
             return '';
         }
 
-        return '<div class="swpb-updated">' . sprintf( esc_html__( 'Poslední aktualizace: %s', 'sw-price-builder' ), esc_html( date_i18n( get_option( 'date_format' ), strtotime( $date ) ) ) ) . '</div>';
+        return '<div class="swpb-updated">' . sprintf( esc_html__( 'Poslední aktualizace: %s', 'sw-price-builder' ), esc_html( $this->format_updated( $date ) ) ) . '</div>';
+    }
+
+    /**
+     * Datum i čas poslední aktualizace (formáty z nastavení WP).
+     */
+    private function format_updated( $mysql_date ) {
+        return date_i18n( get_option( 'date_format' ) . ', ' . get_option( 'time_format' ), strtotime( $mysql_date ) );
     }
 
     private function render_pricelist( $pricelist_id, $args = array() ) {
@@ -456,7 +468,7 @@ final class SW_Price_Builder {
                 <?php $this->render_category_block( $pricelist, $category, $layout ); ?>
             <?php endforeach; ?>
             <?php if ( '1' === $this->get_settings()['show_update_date'] ) : ?>
-                <div class="swpb-updated"><?php echo esc_html( sprintf( 'Poslední aktualizace: %s', date_i18n( get_option( 'date_format' ), strtotime( $pricelist->updated_at ) ) ) ); ?></div>
+                <div class="swpb-updated"><?php echo esc_html( sprintf( 'Poslední aktualizace: %s', $this->format_updated( $pricelist->updated_at ) ) ); ?></div>
             <?php endif; ?>
         </div>
         <?php
@@ -696,6 +708,9 @@ final class SW_Price_Builder {
             wp_die( esc_html__( 'Neplatný bezpečnostní token.', 'sw-price-builder' ) );
         }
 
+        // Po jakékoli změně (handlery končí redirectem + exit) vyčistit cache stránek s ceníkem.
+        add_action( 'shutdown', array( $this, 'purge_page_caches' ) );
+
         switch ( $action ) {
             case 'save_pricelist':
                 $this->handle_save_pricelist();
@@ -885,6 +900,7 @@ final class SW_Price_Builder {
             'load_frontend_css' => ! empty( $_POST['load_frontend_css'] ) ? '1' : '0',
             'show_codes'        => ! empty( $_POST['show_codes'] ) ? '1' : '0',
             'show_update_date'  => ! empty( $_POST['show_update_date'] ) ? '1' : '0',
+            'purge_varnish'     => ! empty( $_POST['purge_varnish'] ) ? '1' : '0',
         );
         update_option( self::OPTION_SETTINGS, $settings );
         $this->redirect_with_notice( 'swpb_settings', 'success', 'Nastavení bylo uloženo.' );
@@ -924,6 +940,7 @@ final class SW_Price_Builder {
                 $wpdb->update( $this->table_categories, array( 'sort_order' => absint( $row['sort_order'] ), 'parent_id' => absint( $row['parent_id'] ) ), array( 'id' => absint( $row['id'] ) ) );
             }
         }
+        $this->purge_page_caches();
         wp_send_json_success();
     }
 
@@ -939,6 +956,7 @@ final class SW_Price_Builder {
                 $wpdb->update( $this->table_items, array( 'sort_order' => absint( $row['sort_order'] ) ), array( 'id' => absint( $row['id'] ) ) );
             }
         }
+        $this->purge_page_caches();
         wp_send_json_success();
     }
 
@@ -1619,16 +1637,116 @@ final class SW_Price_Builder {
                         <fieldset <?php disabled( ! $can_edit_settings ); ?>>
                     <?php wp_nonce_field( 'swpb_save_settings' ); ?>
                     <input type="hidden" name="swpb_action" value="save_settings">
-                    <label><span>Režim výstupu</span><select name="frontend_mode"><option value="dynamic" <?php selected( $settings['frontend_mode'], 'dynamic' ); ?>>Dynamický přes REST endpoint bez cache</option><option value="direct" <?php selected( $settings['frontend_mode'], 'direct' ); ?>>Přímý HTML výstup</option></select></label>
+                    <label><span>Režim výstupu</span><select name="frontend_mode"><option value="dynamic" <?php selected( $settings['frontend_mode'], 'dynamic' ); ?>>HTML + tichá obnova přes REST (doporučeno při cache)</option><option value="direct" <?php selected( $settings['frontend_mode'], 'direct' ); ?>>Jen přímý HTML výstup</option></select></label>
                     <label class="swpb-checkbox"><input type="checkbox" name="load_frontend_css" value="1" <?php checked( $settings['load_frontend_css'], '1' ); ?>> <span>Načítat výchozí frontend CSS pluginu</span></label>
                     <label class="swpb-checkbox"><input type="checkbox" name="show_codes" value="1" <?php checked( $settings['show_codes'], '1' ); ?>> <span>Zobrazovat kód položky v tabulkovém layoutu</span></label>
                     <label class="swpb-checkbox"><input type="checkbox" name="show_update_date" value="1" <?php checked( $settings['show_update_date'], '1' ); ?>> <span>Zobrazovat datum poslední aktualizace ceníku</span></label>
+                    <label class="swpb-checkbox"><input type="checkbox" name="purge_varnish" value="1" <?php checked( $settings['purge_varnish'], '1' ); ?>> <span>Mazat Varnish cache při změně ceníku (zapnout jen na hostingu s Varnishem)</span></label>
                     <div class="swpb-actions swpb-field-full"><button type="submit" class="button button-primary" <?php disabled( ! $can_edit_settings ); ?>>Uložit nastavení</button></div>
                     </fieldset>
                 </form>
             </section>
         </div>
         <?php
+    }
+
+    /* ------------------------------------------------------------------
+     * PURGE CACHE (WP Compress vždy, Varnish jen pokud je zapnutý v nastavení)
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Publikované stránky se shortcodem pluginu (+ homepage).
+     */
+    private function cache_purge_post_ids() {
+        global $wpdb;
+        $ids = $wpdb->get_col(
+            "SELECT ID FROM {$wpdb->posts}
+             WHERE post_status = 'publish'
+               AND post_type NOT IN ('revision','nav_menu_item')
+               AND post_content LIKE '%[sw\\_pricelist%'"
+        );
+        $front = (int) get_option( 'page_on_front' );
+        if ( $front > 0 ) {
+            $ids[] = $front;
+        }
+        return array_values( array_unique( array_map( 'intval', $ids ) ) );
+    }
+
+    /**
+     * Vyčistí cache stránek se shortcodem. Bezpečné na každém webu:
+     * - WP Compress jen pokud je aktivní (hard purge = kopie se opravdu smaže, žádné servírování staré verze),
+     * - Varnish jen pokud je v nastavení zapnutý (HTTP PURGE na konkrétní URL, timeout 1 s),
+     * - jakákoli chyba purge nikdy neshodí uložení dat.
+     */
+    public function purge_page_caches() {
+        static $done = false; // max. 1× za request
+        if ( $done ) {
+            return;
+        }
+        $done = true;
+
+        try {
+            $post_ids = $this->cache_purge_post_ids();
+            foreach ( $post_ids as $pid ) {
+                clean_post_cache( $pid );
+            }
+
+            // WP Compress – save_post hooky mívá vypnuté, proto voláme jeho purge napřímo.
+            if ( defined( 'WPS_IC_DIR' ) ) {
+                $files = array(
+                    'wps_ic_cache_integrations' => 'classes/cache-integrations.class.php',
+                    'wps_ic_cache'              => 'classes/cache.class.php',
+                    'wps_ic_url_key'            => 'traits/url_key.php',
+                    'wps_cacheHtml'             => 'addons/cache/cacheHtml.php',
+                );
+                foreach ( $files as $class => $file ) {
+                    if ( ! class_exists( $class ) && file_exists( WPS_IC_DIR . $file ) ) {
+                        include_once WPS_IC_DIR . $file;
+                    }
+                }
+                if ( class_exists( 'wps_ic_cache' ) && is_callable( array( 'wps_ic_cache', 'removeHtmlCacheFiles' ) ) ) {
+                    foreach ( $post_ids as $pid ) {
+                        wps_ic_cache::removeHtmlCacheFiles( (int) $pid, '', '', 'hard' );
+                    }
+                    wps_ic_cache::removeHtmlCacheFiles( 'home', '', '', 'hard' );
+                }
+            }
+
+            // Další běžné cache pluginy (volá se jen to, co na webu je).
+            if ( function_exists( 'rocket_clean_domain' ) ) { rocket_clean_domain(); }
+            if ( function_exists( 'w3tc_flush_all' ) ) { w3tc_flush_all(); }
+            if ( function_exists( 'wp_cache_clear_cache' ) ) { wp_cache_clear_cache(); }
+            do_action( 'litespeed_purge_all' );
+
+            // Varnish – jen na webech, kde je zapnutý v nastavení pluginu.
+            if ( '1' === $this->get_settings()['purge_varnish'] ) {
+                $urls = array( home_url( '/' ) );
+                foreach ( $post_ids as $pid ) {
+                    $u = get_permalink( $pid );
+                    if ( $u ) {
+                        $urls[] = $u;
+                    }
+                }
+                $urls = array_unique( apply_filters( 'swpb_purge_urls', array_merge( $urls, $this->extra_purge_urls() ) ) );
+                foreach ( $urls as $url ) {
+                    wp_remote_request(
+                        $url,
+                        array(
+                            'method'   => 'PURGE',
+                            'timeout'  => 1,
+                            'blocking' => true,
+                            'headers'  => array( 'X-Purge-Method' => 'exact' ),
+                        )
+                    );
+                }
+            }
+        } catch ( \Throwable $e ) {
+            error_log( 'sw-price-builder: cache purge failed: ' . $e->getMessage() );
+        }
+    }
+
+    private function extra_purge_urls() {
+        return array();
     }
 }
 
